@@ -76,16 +76,40 @@ length × 2 字节     UTF-16 **大端** 文本
 
 ```
 u32 stored_size     后面跟的字节数
-payload             原始字节，或（flags bit0 置位时）zlib 流
+payload             原始字节，或（flags bit0 置位时）qCompress 数据
 ```
 
 ### 最容易搞错的一点
 
-Qt **5** 的压缩资源，`stored_size` 就是**压缩后**的长度，payload 是**裸 zlib 流**，
-**没有**前置的"解压后长度"字段 —— 那是 Qt 6 才加的。
+压缩资源的 payload 是 **Qt `qCompress()` 的格式**，而不是裸 zlib 流：
 
-如果按 Qt 6 的格式去解，会多读 4 个字节的"长度"前缀，然后 zlib 报错或解出垃圾。
-本仓库的 `qtres.py` 里专门注释了这一点。
+```
+u32 BE 未压缩长度 | zlib 流
+```
+
+所以 `stored_size = 4 + len(zlib 流)`，解压时**必须先跳过 4 字节**：
+
+```python
+raw = blob[p + 4 : p + 4 + stored_size]
+dec = zlib.decompress(raw[4:])        # ← 跳过 4 字节
+```
+
+实测（`OptionMenuList.qml`）：
+
+```
+stored_size = 2174 (0x87e)
+raw[:8]     = 00 00 21 fe | 78 9c ...
+              ^^^^^^^^^^^^  ^^^^^^
+              未压缩长度 8702  zlib
+```
+
+直接 `zlib.decompress(raw)` 会抛
+`Error -3 while decompressing data: unknown compression method` ——
+因为开头两个字节是 `00 00` 而不是 zlib 的 `78 9c`。
+
+**这个细节是自写解析器产出垃圾数据的头号原因**，`qtres.py` 里专门注释了。
+
+> 反向写入时别忘了把 4 字节长度前缀加回去，否则自己写出去的数据自己读不回来。
 
 ### 在无符号二进制里找到资源表
 
