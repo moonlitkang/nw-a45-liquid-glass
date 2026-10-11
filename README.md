@@ -1,159 +1,180 @@
-# NW-A45 Liquid Glass
+# nw-a45-liquid-glass
 
-把 Sony Walkman NW-A45 的菜单界面改成半透明玻璃质感（iOS 26 "Liquid Glass" 风格），
-并且**只动 UI 资源，不碰任何一行机器码**。
+把 Sony Walkman **NW-A45 / NW-A40** 的原厂菜单改造成 **iOS 26 风格液态玻璃**（半透明 + 圆角 + 边缘高光），并且保留全部原有功能。
 
-这个仓库是完整的方法与工具链：固件容器解析、ext4 读写、Qt 内嵌资源解析、
-QML 原地替换、主题改色、重新打包、以及一套独立的校验器。
+这不是一份"替换几张图"的教程，而是一套**可复现、可校验、可回退**的固件改造工具链：从 `.UPG` 容器解密、ext4 定位、Qt 内嵌资源解析，到原位补丁、容器重打包、以及 15 项独立校验。
 
-> 目标机型：NW-A40 / NW-A45 系列，固件 Ver 1.10
-> 界面栈：Qt 5.6 + QtQuick 2.3，主程序 `/vendor/sony/bin/HgrmMediaPlayerApp`
+> 适用机型：NW-A40 / NW-A45 系列（固件 V1.10）。其他 Walkman 型号结构类似，但资源表偏移需要重新定位。
 
 ---
 
 ## 效果
 
-| 元素 | 原厂 | 改造后 |
-|---|---|---|
-| 选项菜单面板 | 不透明 PNG 九宫格 | `#cc0e2033` 半透明圆角面板 + 1px 高光边 |
-| 菜单行 | 不透明 PNG | `#ad122842` 半透明圆角 |
-| 选中行 | 按下态 PNG | `#e01e4a72` 高亮 + 亮边 |
-| 上下文菜单 | 不透明 PNG | `#d1102438` 标题栏 / `#c70e2033` 主体 |
-| 分隔线 | PNG | `#803a5a7a` 1px |
-| 全屏压暗层 | 无 | `#400a1420`（25%） |
-| 导航栏 | `black` | `#0a1622` |
-| 全局主题 | `#000000` | `#0a1622` |
-| 列表行/面板底图 | 纯黑 PNG | 全透明 PNG |
+| 改造前 | 改造后 |
+|---|---|
+| 不透明灰色九宫格 PNG 弹窗 | 半透明深蓝玻璃面板 + 18px 圆角 + 1px 边缘高光 |
+| 菜单行 = 每帧解码并拉伸 PNG | 菜单行 = 纯色圆角矩形（**比原厂更快**） |
+| 全局背景纯黑 `#000000` | 全局深蓝 `#0a1622` |
+
+改动落在 5 个 QML 文件、5 个背景 PNG、1 个主题 JSON 上。**其余 1071 个资源、全部 ARM 机器码、内核、bootloader、CM4 音频固件逐字节未变。**
 
 ---
 
-## 仓库结构
+## 能做到什么 / 做不到什么
 
-```
-tools/
-  ext4fs.py          ext4 镜像读写（原地写，不改文件长度）
-  qtres.py           Qt 5 内嵌资源（RCC）解析与原地替换
-  upg.py             .UPG 固件容器 解包 / 重打包
-  minpng.py          手写极小 PNG（Pillow 压不到槽位以内）
-  theme.py           调色板 + QML 替换规则（想改配色改这里）
-  patch_ui.py        主入口：patch / pack
-  verify.py          独立校验器（不复用构建期任何结论）
-  dump_resources.py  把二进制里的资源全导出成文件
-docs/
-  01-upg-container.md        固件容器格式
-  02-ext4-and-qt-resources.md  ext4 与 Qt 资源格式（含三个经典坑）
-  03-ui-architecture.md      播放器 UI 与主题系统结构
-  04-patch-strategy.md       原地替换的五条铁律
-  05-performance.md          在低端 SoC 上的渲染开销分析
-  06-risks-and-recovery.md   变砖风险与恢复路径
-  07-capabilities.md         现在能在播放器上做到哪些事
-keys.example.json            密钥模板（真实密钥不入库）
-```
+**已经做到（本次改造实际落地的）**
+
+- 选项菜单（`…` 键弹出）→ 玻璃面板
+- 上下文菜单（长按 / 右键菜单）→ 玻璃面板 + 玻璃标题栏
+- 菜单行的普通态 / 选中态 / 分隔线 → 圆角半透明
+- 导航栏 → 深蓝
+- **全局主题色** → 所有引用 `viewstyle.bgcolor` 的界面（40+ 个 QML：库视图、播放控件、设置页、状态栏）一起变色
+- 列表行 / 播放器面板背景 → 透明，让主题色透出
+
+**原理上还能做（同一套工具链，只是要写新的替换规则）**
+
+- 播放界面、文件浏览页、设置页的逐个控件
+- 图标、字体、启动画面（boot logo）、关机动画
+- 字符串与本地化文本
+- 音效参数（EQ 曲线、DSEE 预设、Clear Phase / VPT / DC Phase 的系数表）
+
+**做不到 / 有硬限制**
+
+- ❌ **模糊（blur）**。NW-A45 是低端 MediaTek + Mali，模糊要走 shader 或 `layer.enabled`，代价是每帧一次离屏渲染。所以玻璃感靠 alpha + 圆角 + 高光边模拟。
+- ❌ 任意布局重排。QML 在固定大小槽位里，**只能净减小体积**，不能变大（见 `docs/04`）。
+- ❌ 加新功能（新解码格式、新协议）。那要动原生代码，不在本工具链范围。
+- ⚠️ 不能保证"零风险刷入"。见 `docs/06`。
 
 ---
 
 ## 快速开始
 
 ```bash
+# 1. 依赖
 pip install -r requirements.txt
 
-# 1) 先导出资源，看看原厂长什么样
-python tools/dump_resources.py system.img -o work/resources
+# 2. 从官方升级包解出 system.img（或者用你已有的）
+#    官方包 NW-A40_V1_10.exe 里含 NW_WM_FW.UPG，再用 tools/upg.py 解出 sector 6
 
-# 2) 打补丁（只改镜像，不打包）
-python tools/patch_ui.py patch system.img --out system_glass.img
+# 3. 把密钥放进 keys.local.json（见下）
+cp keys.example.json keys.local.json
 
-# 3) 校验
-python tools/verify.py image system_glass.img system.img
+# 4. 打补丁
+python tools/patch_ui.py patch stock.img --out patched.img
 
-# 4) 需要可安装的固件包时（要先配好 keys.local.json）
-cp keys.example.json keys.local.json   # 填入密钥
-python tools/patch_ui.py pack system.img NW_WM_FW.UPG --out NW_WM_FW_glass.UPG
-python tools/verify.py upg NW_WM_FW_glass.UPG NW_WM_FW.UPG system_glass.img
+# 5. 独立验证（15 项）
+python tools/verify.py image patched.img stock.img
+python tools/verify.py upg   patched.UPG stock.UPG patched.img
+
+# 6. 重打包容器
+python tools/patch_ui.py pack stock.img stock.UPG --out patched.UPG
 ```
 
 ### 关于密钥
 
-`.UPG` 容器用的是设备家族相关的 AES 密钥。**本仓库不附带**，请放到
-`keys.local.json`（已被 `.gitignore` 排除）或通过环境变量
-`WALKMAN_UPG_KAS` / `WALKMAN_UPG_PASSKEY` / `WALKMAN_UPG_IV` 传入。
+`tools/upg.py` 需要三组密钥材料才能解开 `.UPG` 容器。**本仓库不附带这些值**，请自行放入 `keys.local.json`（已在 `.gitignore` 中）：
 
-不含密钥时，**除第 4 步以外的所有功能都能正常使用**——资源导出、QML 替换、
-主题改色、镜像校验都不需要密钥。详见 [docs/01](docs/01-upg-container.md)。
+```json
+{
+  "kas": "<hex>",
+  "aes_passkey": "<16 ascii>",
+  "aes_iv": "<16 ascii>"
+}
+```
 
----
+也可以用环境变量 `WALKMAN_UPG_KAS` / `WALKMAN_UPG_PASSKEY` / `WALKMAN_UPG_IV`。
 
-## 设计原则
-
-改造只做一件事：**把固定大小的资源槽位里的 QML 文本换成另一段更短的文本**。
-
-因此有五条硬性约束（[docs/04](docs/04-patch-strategy.md) 详述）：
-
-1. **净减小体积** —— 槽位是固定的，写超了就会截断，截断的 QML 是语法错误，
-   菜单会直接打不开。
-2. **元素类型一起换** —— 只改属性不改元素类型，等于什么都没改。
-3. **每处替换必须断言** —— 匹配不上就报错中止，绝不静默跳过。
-4. **不引入昂贵构造** —— 禁用 `FastBlur` / `GaussianBlur` / `DropShadow` /
-   `ShaderEffect` / `layer.enabled` / `opacity:`。
-5. **写完必须回读校验** —— 每个文件都重新解出来查括号平衡、查是否被截断。
-
-另外：**绝不做任何改变文件长度的写入**。system.img 的 ext4 元数据（超级块、
-块位图、inode 表）与原始镜像逐字节一致，差异只落在两个文件的数据块里。
+**没有密钥时，除容器打包外的所有工具仍然可用** —— 资源提取、QML 补丁、镜像校验都不需要密钥。
 
 ---
 
-## 校验
-
-`tools/verify.py` 是独立实现的，不复用构建期的任何中间结果：
+## 工具链
 
 ```
-$ python tools/verify.py image system_glass.img system.img
-  [PASS] same image size
-  [PASS] only expected files differ   -- 11 blocks, 2 files
+tools/
+├── config.py          配置与密钥加载
+├── ext4fs.py          极简 ext4 读写（只读目录、原位写文件）
+├── qtres.py           Qt 5 内嵌资源（RCC）读写
+├── upg.py             .UPG 容器解包 / 重打包
+├── minpng.py          手写最小 PNG（用于塞进固定槽位）
+├── theme.py           玻璃配色表 + QML 替换规则
+├── dump_resources.py  把二进制里所有资源导出成文件树
+├── patch_ui.py        主补丁脚本（patch / pack 两个子命令）
+└── verify.py          15 项独立校验
+```
+
+---
+
+## 文档
+
+| 文档 | 内容 |
+|---|---|
+| [docs/01-upg-container.md](docs/01-upg-container.md) | `.UPG` 容器格式、加密结构、分块压缩 |
+| [docs/02-ext4-and-qt-resources.md](docs/02-ext4-and-qt-resources.md) | ext4 定位、Qt 资源树、如何在无符号 ARM 二进制里找到资源表 |
+| [docs/03-ui-theme-architecture.md](docs/03-ui-theme-architecture.md) | 播放器 UI 架构、QML 目录、`viewstyle` 全局主题机制 |
+| [docs/04-patch-strategy.md](docs/04-patch-strategy.md) | 固定槽位补丁策略（净减小、断言、不静默回退） |
+| [docs/05-performance.md](docs/05-performance.md) | 渲染开销审计：为什么这个改动比原厂更快 |
+| [docs/06-risks-and-recovery.md](docs/06-risks-and-recovery.md) | 变砖风险分析、分区表、恢复方案 |
+| [docs/07-capabilities.md](docs/07-capabilities.md) | 播放器上能做 / 不能做哪些改造 |
+
+---
+
+## 实测校验结果
+
+本工具链产出的镜像与容器，通过 **15/15** 项独立校验：
+
+```
+== image checks ==
+  [PASS] same image size                    838,860,800 == 838,860,800
+  [PASS] only expected files differ         11 block(s) across
+                                            ['/vendor/sony/bin/HgrmMediaPlayerApp',
+                                             '/vendor/sony/bin/ScreenSettings.json']
   [PASS] ext4 superblock + group descriptors unchanged
-  [PASS] patched file sizes unchanged
+  [PASS] patched file sizes unchanged (no ext4 metadata churn)
   [PASS] patched QML sane (balanced, not truncated, no BorderImage)
   [PASS] no blur/shader/layer/opacity constructs
   [PASS] theme recoloured (#0a1622)
   [PASS] stock theme colour gone
-8/8 checks passed
+  8/8 checks passed
 
-$ python tools/verify.py upg NW_WM_FW_glass.UPG NW_WM_FW.UPG system_glass.img
+== upg checks ==
   [PASS] container self-MD5
-  [PASS] file count matches stock
+  [PASS] file count matches stock            9
   [PASS] sector layout identical to stock
   [PASS] system sector decodes to the expected patched image
   [PASS] device-side md5 manifest matches decoded image
-  [PASS] all other sectors byte-identical to stock
+  [PASS] all other sectors (0,2-5,7,8) byte-identical to stock
   [PASS] encrypted header identical to stock
-7/7 checks passed
+  7/7 checks passed
 ```
 
+关键数字：
+
+| 项 | 值 |
+|---|---|
+| 镜像差异 | **11 个 4K 块**（约 4 MB 范围），全部落在 2 个预期文件内 |
+| ext4 元数据差异 | **0** |
+| 未修改 sector | **7 / 9**（0,2,3,4,5,7,8 逐字节相同） |
+| 改动资源 | **5 个 QML + 3 个 PNG + 1 个主题 JSON** |
+| 未改动资源 | **1071 个** |
+
+## 血泪教训（都写进代码里了）
+
+1. **固定槽位只能变小。** 第一版补丁让 QML 变长了，写回时尾部 `}` 被截断 → QML 语法错误 → **菜单打不开**。现在脚本对每次替换都做断言，塞不下直接中止。
+2. **压缩资源重压缩后可能变大。** 第一版遇到这种情况静默回退成原版，导致"改了一半"。现在改为中止。
+3. **`.UPG` 里有个设备端 MD5 清单（sector 1）。** `update.sh` 会 grep 它，命中就走 `fwpup -z`（写后校验）。忘了同步这个清单，刷写会在中途失败。
+4. **`opacity` 属性会触发离屏渲染。** 半透明要用单条 ARGB 颜色（`#AARRGGBB`），不要 `color` + `opacity` 两个属性。
+5. **容器里整个 sector 是一整条 CBC 流**，不是每块独立加密；分块之间**没有** 16 字节对齐。假设错了会得到"前 16 字节看起来对、后面全是噪声"的数据。
+
 ---
 
-## 风险
+## 免责声明
 
-**改造前请先读完 [docs/06](docs/06-risks-and-recovery.md)。**
+- 本项目**仅供个人学习与自有设备改造**。修改固件可能使设备无法启动，风险自负。
+- 仓库**不包含** Sony 的任何固件、密钥或受版权保护的资源。所有代码为原创实现。
+- 请先备份原厂固件与设备数据。刷写前确认你有可用的恢复路径（见 `docs/06`）。
+- Sony、Walkman 是 Sony Corporation 的商标。本项目与 Sony 无任何关联。
 
-简版：
+## 许可
 
-* 只改了 2 个文件、11 个 4 KiB 块；bootloader / recovery / TrustZone / 内核 /
-  CM4 音频固件全部原封不动。
-* 即使 system 分区写坏，recovery 仍在，用官方升级器可以完整刷回原厂固件。
-* 唯一需要额外小心的是 `update.sh` 在**缺少匹配的校验信息时会先清零分区**，
-  所以设备端 `md5.txt` 清单必须与 system.img 同步更新（工具已自动处理）。
-
-**没有实机测试过就不要刷。** 静态校验能证明「结构完好、语法正确」，
-不能证明「渲染效果符合预期」。
-
----
-
-## 法律与免责
-
-* 本项目仅用于**个人设备的所有权范围内修改**与逆向学习。
-* 不包含 Sony 的固件本体、密钥或任何受版权保护的素材；`theme.py` 里的
-  替换规则是重新编写的，`dump_resources.py` 输出的是**你自己设备上**的固件内容。
-* 刷机有风险，可能导致设备无法开机或数据丢失。后果自负。
-* 与 Sony 无任何关联，未获其授权或认可。
-
-代码以 MIT 许可发布，见 [LICENSE](LICENSE)。
+MIT（见 `LICENSE`）。

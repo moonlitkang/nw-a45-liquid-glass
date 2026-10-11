@@ -1,131 +1,138 @@
 # 02 · ext4 与 Qt 内嵌资源
 
-这一篇记录解析过程中踩到的三个坑。它们都是那种「看起来快成功了、
-结果输出一堆乱码」的类型。
+## 目标文件
+
+播放器主程序：`/vendor/sony/bin/HgrmMediaPlayerApp`
+- 8,644,592 字节，32 位 ARM ELF
+- Qt 5.6 + QtQuick 2.3
+- 整个 UI（QML + 图片）编译在二进制内部，通过 Qt 资源系统（RCC）加载
+
+同一目录下还有 `ScreenSettings.json`（全局主题配置，见 `docs/03`）。
 
 ---
 
-## 一、ext4：原地写，不碰元数据
+## ext4 定位
 
-`system.img` 是标准 ext4（4096 字节块，extent 格式）。要改的东西只有一个文件：
+镜像块大小 4096。定位一个文件需要走三步：
 
-```
-/vendor/sony/bin/HgrmMediaPlayerApp      8,644,592 字节，32 位 ARM ELF
-```
+1. **超级块**：偏移 1024，`s_magic` 应为 `0xEF53`。
+   - `s_log_block_size` → 块大小
+   - `s_inodes_per_group`、`s_inode_size`、`s_feature_incompat`
+2. **组描述符表**：紧跟超级块（块大小 1024 时从块 2 开始，否则从块 1）。
+   - `bg_inode_table_lo`（+ `_hi` 当 64BIT 特性置位）→ inode 表位置
+3. **inode**：`(num-1)//ipg` 定组，`(num-1)%ipg` 定组内下标。
+   - `i_mode` 判类型（`0x8000` = 普通文件，`0x4000` = 目录）
+   - `i_size_lo` / `i_size_high`
+   - `i_block[60]` 起始是 extent 树
 
-**关键约束：写入不能改变文件长度。**
+### extent 树
 
-ext4 里文件长度记录在 inode 的 `i_size` 上。如果我们改了长度，就得同时更新
-inode 表、块位图，必要时还要分配新块——任何一步出错都会让文件系统损坏，
-而且这种损坏**在刷机时不会立刻暴露**，等设备启动到挂载分区才炸。
+节点头 12 字节：`eh_magic(0xF30A)`、`eh_entries`、`eh_max`、`eh_depth`、`eh_generation`。
+之后每项 12 字节：
 
-所以 `tools/ext4fs.py` 的 `write_file()` 只做一件事：把数据写进
-`i_block` 里已经登记过的 extent 对应的物理块，不足部分补零，
-`i_size` 一个字节都不动。
+- `depth == 0`（叶子）：`ee_block`(u32)、`ee_len`(u16)、`ee_start_hi`(u16)、`ee_start_lo`(u32)
+  → 逻辑块、物理块、块数
+- `depth > 0`（索引）：`ei_block`(u32)、`ei_leaf_lo`(u32)、`ei_leaf_hi`(u16)、`ei_unused`(u16)
+  → 递归读子节点
 
-结果是：补丁后的镜像与原始镜像相比，**只有 11 个 4 KiB 块不同**，
-全部落在 `HgrmMediaPlayerApp` 和 `ScreenSettings.json` 的数据块里，
-超级块、组描述符、块位图、inode 位图、inode 表逐字节一致。
+注意 `ee_len` 要 `& 0x7FFF`：最高位是"未初始化 extent"标志。
 
----
+### 原位写入
 
-## 二、Qt 内嵌资源（RCC）：`qCompress` 的 4 字节头
+本工具链**只做原位写入**：文件长度不变，因此块位图、inode 位图、inode 表本身
+**完全不动**。这是刻意设计 —— ext4 元数据零改动意味着镜像的其它部分与出厂状态
+逐字节一致，出问题时排查范围极小。
 
-### 结构
-
-Qt 5 的资源编译进二进制后是三张表：
-
-```
-tree table   14 字节/节点，大端
-    u32 name_offset
-    u16 flags           bit0 = 压缩, bit1 = 目录
-    目录:  u32 child_count, u32 child_offset
-    文件:  u32 locale,      u32 data_offset
-
-name table   u16 长度 | u32 hash | UTF-16BE 文本
-data table   u32 stored_size | payload
-```
-
-### 坑 1：压缩资源多一个 4 字节头
-
-rcc 用的是 Qt 的 `qCompress()`，而 `qCompress()` **会在前面加一个 4 字节
-大端未压缩长度**：
-
-```
-00 00 08 7e | 00 00 21 fe | 78 9c ...
-^ stored    ^ uncompressed ^ zlib
-   2174          8702
-```
-
-`stored_size = 4 + len(zlib)`，payload = `[u32 BE 未压缩长度][zlib 流]`。
-
-如果直接把整个 payload 丢给 `zlib.decompress()`，会得到：
-
-```
-zlib.error: Error -3 while decompressing data: unknown compression method
-```
-
-因为开头两个字节是 `00 00`，不是 zlib 的 `78 9c`。**必须先跳过 4 字节。**
-
-未压缩资源没有这个头，`stored_size` 就是文件长度。
-
-### 坑 2：`stored_size` 同时就是槽位大小
-
-下一个资源紧跟在 `data_offset + 4 + stored_size` 之后。所以替换后的 payload
-**不能超过原来的 `stored_size`**。这不是「最好别超」，是「超了就覆盖掉
-隔壁资源」。
-
-### 坑 3：在 ARM Thumb 二进制里找表指针
-
-二进制被 strip 过，没有符号。但编译器生成的 `qRegisterResourceData()`
-包装函数有固定形态：
-
-```
-0a 49 01 20 0a 4a 0b 4b 80 b5 00 af
-```
-
-即 `ldr r1, [pc, #..]` / `movs r0, #1` / `ldr r2, [pc, #..]` /
-`ldr r3, [pc, #..]` / `push {r7, lr}` / `add r7, sp, #0`。
-
-顺着这个模式能找到所有资源表，但**三个 `add` 指令各自的 PC 值不同**：
-
-| 指令 | 偏移 | PC 基准 |
-|---|---|---|
-| 第 1 个 LDR | +0 | +0x10 |
-| 第 2 个 LDR | +4 | +0x12 |
-| 第 3 个 LDR | +6 | +0x14 |
-
-（Thumb 的 PC 是「当前指令地址 + 4」，而对齐规则让这三条各差 2。）
-
-如果统一按 `+0x10` 算，三个指针里只有一个是对的，另外两个会指到
-莫名其妙的地方——表现为「有时能解出资源，有时解出一堆乱码」。
-
-NW-A45 上主 UI 的资源表在 ELF 内偏移：
-
-```
-tree  = 0x548E88
-names = 0x549820
-data  = 0x54B2F8
-```
-
-但 `tools/qtres.py` 的 `find_chunks()` 会自己重新找一遍（共找到 34 张表），
-不依赖硬编码。
+`Ext4.write_file()` 会检查 `len(data) <= 已分配块数 × 块大小`，超了直接报错。
 
 ---
 
-## 三、导出结果
+## Qt 5 资源格式（RCC v1）
 
-`tools/dump_resources.py` 会把 34 张表里的资源按原始 qrc 路径全部导出：
+### 三张表
+
+**tree 表** —— 14 字节一个节点，大端：
 
 ```
-work/resources/chunk_8/components/menu/OptionMenu.qml
-work/resources/chunk_8/components/menu/OptionMenuList.qml
-work/resources/chunk_8/components/menu/ContextMenu.qml
-work/resources/chunk_8/components/menu/ContextMenuList.qml
-work/resources/chunk_8/components/NavigationBar.qml
-work/resources/chunk_0/assets/images/...
-...
+u32 name_offset     名称表偏移（根节点为 0）
+u16 flags           bit0 = 已压缩，bit1 = 目录
+--- 若为目录 ---
+u32 child_count
+u32 child_offset    第一个子节点的**索引**（子节点连续排列）
+--- 若为文件 ---
+u32 locale
+u32 data_offset     data 表偏移
 ```
 
-主 UI（chunk 8）里有 271 个 QML 文件，全部是可读源码——没有字节码，
-没有混淆。这一点让整个改造从「逆汇编」降级成了「改文本」。
+**names 表**：
+
+```
+u16 length          UTF-16 码元个数
+u32 hash            Qt 自己的名字哈希（读取时不需要）
+length × 2 字节     UTF-16 **大端** 文本
+```
+
+**data 表**：
+
+```
+u32 stored_size     后面跟的字节数
+payload             原始字节，或（flags bit0 置位时）zlib 流
+```
+
+### 最容易搞错的一点
+
+Qt **5** 的压缩资源，`stored_size` 就是**压缩后**的长度，payload 是**裸 zlib 流**，
+**没有**前置的"解压后长度"字段 —— 那是 Qt 6 才加的。
+
+如果按 Qt 6 的格式去解，会多读 4 个字节的"长度"前缀，然后 zlib 报错或解出垃圾。
+本仓库的 `qtres.py` 里专门注释了这一点。
+
+### 在无符号二进制里找到资源表
+
+ELF 被 strip 过，没有符号。但 Qt 的资源注册代码是编译器生成的固定形状：
+
+```asm
+; ARM Thumb
+ldr  r1, [pc, #..]      ; tree
+movs r0, #1             ; version = 1
+ldr  r2, [pc, #..]      ; names
+ldr  r3, [pc, #..]      ; data
+push {r7, lr}
+add  r7, sp, #0
+bl   qRegisterResourceData
+```
+
+按这段字节模式（`0a4901200a4a0b4b80b500af`）搜索，然后**解码三条 PC 相对字面量
+加载**，就能得到三张表的地址。
+
+关键细节：三条 `add rX, pc, #imm` 指令各自使用**不同的 PC 值**（`addr+0x10`、
+`addr+0x12`、`addr+0x14`），不能统一按一个偏移算。算错会得到三个几乎正确、
+但差几字节的地址 —— 于是解析出"看起来像树、实际是垃圾"的结果。
+
+NW-A45 这个 build 里能找到 **34 个**资源表，共 **1076 个**资源文件。
+
+---
+
+## 导出结果示例
+
+```
+work/resources/
+├── chunk_0/assets/images/...          (图片、图标)
+├── chunk_1/...
+├── ...
+├── chunk_8/
+│   ├── components/
+│   │   ├── NavigationBar.qml
+│   │   └── menu/
+│   │       ├── OptionMenu.qml
+│   │       ├── OptionMenuList.qml
+│   │       ├── ContextMenu.qml
+│   │       └── ContextMenuList.qml
+│   ├── framework/
+│   │   ├── FrameWork.qml
+│   │   └── Dialog.qml
+│   └── parts/...
+└── chunk_33/...
+```
+
+用 `python tools/dump_resources.py stock.img -o work/resources` 生成。

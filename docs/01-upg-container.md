@@ -1,133 +1,131 @@
-# 01 · 固件容器格式（.UPG）
+# 01 · `.UPG` 容器格式
 
-## 外层：官方升级器
+Sony Walkman 的固件升级包是 `NW_WM_FW.UPG`，由 PC 端 `SoftwareUpdateTool.exe`
+通过 USB 推送到设备，设备端由 `update.sh` 消费。
 
-Sony 的固件以 `NW-A40_V1_10.exe` 形式发布，这是一个 Sony Packaging Manager
-(SPM) 自解压包。运行一次之后，它会把内容释放到
-
-```
-%ProgramData%\Sony Corporation\Sony Packaging Manager\PackagingTemp\<GUID>\
-```
-
-里面有：
-
-| 文件 | 作用 |
-|---|---|
-| `SoftwareUpdateTool.exe` | 真正干活的升级器（负责 USB 传输） |
-| `Data\Device\NW_WM_FW.UPG` | 固件本体 |
-| `Data\Device\SWUpdate.xml` | 版本描述 |
-| `AssistFile.ini` | 升级器行为开关 |
-
-`AssistFile.ini` 里有一个关键项：
-
-```ini
-UseSonyCheck=0
-```
-
-`UseSonyCheck=0` 表示**升级器不做 Sony 签名校验**。这是能重刷同版本固件的前提。
-
-## 内层：NW_WM_FW.UPG
+## 整体布局
 
 ```
-偏移          长度        内容
-0x000         0x010       明文 MD5(文件从 0x010 到 EOF)
-0x010         0x0C0       AES-128-ECB 加密的头部
-0x0C0         ...         AES-128-CBC 加密的数据区
+偏移        长度        内容
+0x000       0x010       明文 MD5(从 0x010 到文件末尾)
+0x010       0x0C0       AES-128-ECB 加密的头部
+0x0C0       ...         AES-128-CBC 加密的数据区
 ```
 
-### 头部（解密后）
+### 头部（解密后 0xC0 字节）
 
 ```
-0x00  16 字节   签名，ASCII 形式（派生自密钥）
-0x10   4 字节   file_count，u32 小端
-0x14  16*n      每条记录：offset(u32 LE) + size(u32 LE)
+[0x00:0x10]  签名，应为派生出的 sig（32 字节 ASCII 十六进制文本）
+[0x10:0x14]  file_count，u32 小端
+[0x14:...]   file_count × 16 字节记录，每条 = offset(u32 LE) + size(u32 LE)
 ```
 
-NW-A45 Ver 1.10 的 `file_count = 9`，9 个 sector 依次是：
+`file_count` 实测为 **9**，9 个 sector 依次对应：
 
-| # | 偏移 | 大小 | 内容 |
-|---|---|---|---|
-| 0 | 0x0000C0 | 0x2000 | 引导相关 |
-| 1 | 0x0020C0 | 0x1000 | **设备端 MD5 清单**（纯文本） |
-| 2 | 0x0030C0 | 0x64D000 | 分区映像 |
-| 3 | 0x6500C0 | 0x021000 | 分区映像 |
-| 4 | 0x6710C0 | 0x044000 | 分区映像 |
-| 5 | 0x6B50C0 | 0x0AF000 | 分区映像 |
-| 6 | 0x7640C0 | 0x684E000 | **system.img（ext4，800 MiB）** |
-| 7 | 0x6FB20C0 | 0x006000 | CM4 音频固件 |
-| 8 | 0x6FB80C0 | 0x002000 | NVP 参数 |
+| # | 内容 | 说明 |
+|---|---|---|
+| 0 | boot / 引导脚本区 | 未改动 |
+| 1 | **设备端 MD5 清单** | 见下节，**必须同步** |
+| 2 | bootloader | 未改动 |
+| 3 | 内核 | 未改动 |
+| 4 | recovery | 未改动 |
+| 5 | TrustZone / tee | 未改动 |
+| 6 | **system.img（ext4）** | 本次唯一修改的镜像 |
+| 7 | CM4 音频协处理器固件 | 未改动 |
+| 8 | 杂项 | 未改动 |
 
-### 加密方式
+### 数据区
 
-* 头部：AES-128-ECB。
-* 数据区：**每个 sector 单独**用 AES-128-CBC 加密，IV 固定。
-  不是「整个数据区一条 CBC 链」——这一点搞错的话，前 16 字节看起来是对的，
-  后面全是噪声，非常容易浪费一整天。
+**整个 sector 是一整条 AES-128-CBC 流**，用固定 IV，不是每 16 字节独立加密。
 
-密钥派生（`tools/upg.py`）：
+> 这里踩过坑：按"每块独立 CBC"去解，会得到前 16 字节看起来正常、后面全是噪声
+> 的数据 —— 因为第一条链的 IV 对了，后续链的 IV 全错。
 
-```
-ks  = AES-CBC(passkey, iv).decrypt(kas)
-key = ks[0:16]
-sig = ks[16:32]
-```
-
-`kas` / `passkey` / `iv` 三份密钥材料本仓库不附带，见 README「关于密钥」。
-
-## sector 1：设备端 MD5 清单 —— 最容易漏掉的一步
-
-sector 1 解密后是纯文本，形如：
+密钥派生（三个常量由设备族密钥材料推出）：
 
 ```
-838860800 9e7453cc84fbf98badd85dc4d911a060 system.img
+ks  = AES-128-CBC(PASSKEY, IV).decrypt(KAS)
+key = ks[:16]      # 数据密钥
+sig = ks[16:32]    # 头部签名
+```
+
+这三组值不在本仓库中，见 README「关于密钥」。
+
+---
+
+## sector 6：system 镜像的压缩格式
+
+解密后的 system sector 是**紧密排列**的块流：
+
+```
+[u32 小端 压缩长度][zlib 数据]  × 204800
+```
+
+- 每块解压后**恰好 4096 字节**（一个 ext4 块）
+- 204800 × 4096 = **838,860,800** 字节，正好是完整镜像
+- 记录之间**没有**任何对齐或填充
+
+> 第二个坑：按 16 字节对齐去解析，第 2 块就会解压失败。AES 块大小是 16，
+> 但压缩块是紧凑排列的 —— 两者无关。整个流只在最后补一次零到 16 的倍数。
+
+## sector 1：设备端 MD5 清单
+
+解密后是一段纯文本，形如：
+
+```
+838860800 <32位md5> system.img
 ...
 ```
 
 设备端 `update.sh` 的逻辑大致是：
 
 ```sh
-grep system.img md5.txt
-if [ $? -eq 0 ]; then
-    fwpup -z ...      # 写入 + 校验
-else
-    fwpup ...         # 只写
-fi
+grep system.img md5.txt && fwpup -z ...
 ```
 
-也就是说：**清单里有这一行就走「写入并校验」分支**。如果你重建了 system 分区
-却忘了同步这里的 MD5，写后校验必然失败，刷写可能中途中止——而中止意味着
-后续的 cm4 / nvp 写入都不会执行。
+**当清单里存在该行时，会走 `fwpup -z`（写入 + 校验）。** 所以只要重新生成了
+`system.img`，就**必须**把这一行的 MD5 同步更新，否则：
 
-`tools/upg.py` 的 `set_md5_manifest_entry()` 会在打包时自动刷新这一行，
-并且断言**行长不变**（清单本身也是定长槽位）。
+- 校验失败 → 刷写报错中止
+- 更糟：中止发生在后续 sector（CM4 / NVP）写入之前，可能留下不一致状态
 
-## sector 6：system 分区编码
+本仓库的 `Upg.set_md5_manifest_entry()` 负责这件事，并且会断言新行长度与旧行一致
+（避免改变 sector 1 的长度从而破坏布局）。
 
-解密后不是裸的 ext4 镜像，而是一个**紧密排列的块流**：
+---
 
+## 重打包流程
+
+```python
+upg = Upg(stock_upg_bytes)
+
+# 1. 重新编码 system 镜像
+body = Upg.encode_block_stream(patched_img)     # 4K 块 + zlib + 紧凑排列 + 补零
+upg.sector_encrypt(6, body + zeros_to_slot)     # 保持 sector 长度不变
+
+# 2. 同步设备端清单
+upg.set_md5_manifest_entry("system.img", md5(patched_img), len(patched_img))
+
+# 3. 重算整包 MD5 并写出
+upg.save(out_path)
 ```
-u32 LE 压缩长度 | zlib 数据      <- 解压后恰好 4096 字节
-u32 LE 压缩长度 | zlib 数据
-...
-```
 
-共 **204800** 块 = 204800 × 4096 = 838,860,800 字节 = 800 MiB。
+关键约束：**每个 sector 的长度必须保持不变**。头部里的 offset/size 记录是固定的，
+改长度会让后面所有 sector 错位。所以编码后的数据超过原槽位时要直接报错，不能截断。
 
-**没有对齐**。不按 16 字节对齐，不按 4096 对齐，就是紧挨着排。
-（因为要喂给 AES，所以整个块流末尾会补零到 16 字节的整数倍。）
+实测：838,860,800 字节镜像 → 109,367,216 字节编码后数据，原槽位 109,371,392 字节，
+余量约 4 KB（正好够最后的补零）。
 
-打包时反向操作：逐 4096 字节压缩、拼成块流、补零、整体 CBC 加密、
-塞回原槽位。因为重新压缩后的体积一定小于原槽位，所以不需要改头部记录。
+---
 
-## 完整的重打包流程
+## 校验清单
 
-`tools/patch_ui.py pack` 做的事：
+`tools/verify.py upg` 会独立重算以下 7 项：
 
-1. 复制原始 system.img，打 UI 补丁；
-2. 逐 4096 字节压缩 → 块流 → 补零 → AES-CBC 加密 → 覆盖 sector 6；
-3. 重算 system.img 的 MD5 → 改写 sector 1 的清单行 → 重新加密；
-4. 重算整包 MD5 → 写入文件头 16 字节；
-5. 回读校验：解密 sector 6 → 解压 → 与源镜像逐字节比较；
-   解密 sector 1 → 确认清单里的 MD5 与镜像一致。
-
-第 3 步和第 5 步是这个流程里唯一「不做就可能刷坏」的部分。
+1. 整包 MD5 自校验 `md5(blob[16:]) == blob[:16]`
+2. 头部签名正确、`file_count` 与 stock 一致
+3. 9 条 offset/size 记录与 stock 完全一致（布局未变）
+4. sector 6 解密 + 逐块解压 == 补丁镜像（逐字节）
+5. sector 1 清单里的 MD5 == sector 6 实解出的 MD5
+6. sector 0/2/3/4/5/7/8 与 stock **逐字节相同**
+7. 加密头部 `[0x10:0x10C0]` 与 stock 逐字节相同

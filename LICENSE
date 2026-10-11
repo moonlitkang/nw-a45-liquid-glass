@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2026 NW-A45 Liquid Glass contributors
+Copyright (c) 2026 nw-a45-liquid-glass contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -20,16 +20,9 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
----------------------------------------------------------------------------
+---
 
-NOTE ON SCOPE
-
-This licence covers the tooling and documentation in this repository only.
-
-It does NOT grant any rights to Sony firmware, device software, encryption
-keys, artwork, or any other third-party material. This project ships no
-firmware and no key material. Anything you extract with these tools is your
-own device's content, and modifying a device you own is your own decision and
-your own risk.
-
-Not affiliated with, endorsed by, or supported by Sony.
+This repository contains no Sony firmware, no Sony cryptographic key material,
+and no Sony copyrighted assets. It is an independent reimplementation of the
+container and resource formats, provided for interoperability and for
+modifying hardware the user already owns.

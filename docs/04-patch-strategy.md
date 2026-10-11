@@ -1,67 +1,45 @@
-# 04 · 原地替换的五条铁律
+# 04 · 固定槽位补丁策略
 
-这一篇是踩坑记录。第一版补丁**刷进去了但完全没生效**，而且把菜单弄坏了
-（点「…」不弹界面）。原因全部在这五条里。
+这一篇记录的是**实际踩过的坑**，以及为什么 `tools/patch_ui.py` 长成现在这样。
 
----
+## 核心约束：槽位是固定的
 
-## 铁律 1：替换必须净减小体积
+QML 文件编译在二进制的 Qt 资源表里，每个文件占一个**固定大小的槽位**
+（`data` 表里的 `stored_size`）。补丁只能在槽位内做，**不能改变文件长度**。
 
-资源槽位是固定的。第一版的问题：
+原因：改长度会让后面所有资源错位，而资源表里的偏移是写死的。
 
-```
-OptionMenu.qml       2888 B 槽位 → 替换后 3050 B   ← 超出
-```
+## 第一版为什么把菜单改坏了
 
-写超之后代码没报错，而是**静默截断**。结果 QML 文件末尾的 `}` 被切掉了：
+第一版补丁只替换了属性行，没换元素类型：
 
 ```qml
-        }
-    }
-// ← 文件到这里就没了，最后两个大括号不见了
-```
-
-QML 解析失败 → 整个菜单组件加载不了 → 点「…」什么都不弹。
-
-**正确做法**：
-
-* 先测新文本长度，超了就报错中止；
-* 靠删注释腾空间（CJK 注释在 UTF-8 里一个字符 2–3 字节，
-  是最便宜的减重来源）；
-* 尽量让替换本身也变小（`BorderImage` 换成 `Rectangle` 通常更短）。
-
-实际结果：
-
-| 文件 | 原大小 | 改后 | 槽位 | 余量 |
-|---|---|---|---|---|
-| `OptionMenu.qml` | 2888 | 2858 | 2888 | 30 |
-| `OptionMenuList.qml` | 8702 | 7174 | 2174（压缩） | 423 |
-| `ContextMenu.qml` | 1860 | 1738 | 1860 | 122 |
-| `ContextMenuList.qml` | 5880 | 4978 | 1685（压缩） | 502 |
-| `NavigationBar.qml` | 2755 | 2375 | 2755 | 380 |
-
-## 铁律 2：元素类型要跟着一起换
-
-第一版只改了属性，没改元素类型：
-
-```qml
-BorderImage {                          ← 还是 BorderImage
+BorderImage {
     id: backgroundImage
-    source: p.option_background_parts  ← 还在贴 PNG
-    color: "#cc0e2033"                 ← 加了 color，但 BorderImage 不认
-    radius: 18                         ← 同上，无效
+    source: p.option_background_parts
+    color: "#cc0e2033"        // ← 加了这个，但 BorderImage 没有 color 属性
+    ...
 }
 ```
 
-`BorderImage` 没有 `color` / `radius` 属性。QML 对未知属性只会警告，
-不会报错，于是**看起来改了、实际一点效果都没有**——这正好解释了
-「整个菜单还是原来的风格」。
+两个致命问题：
 
-必须把元素类型一起换掉：
+1. **新文本比原文件长** → 写回时超出槽位 → **尾部 `}` 被截断** →
+   QML 语法错误 → **菜单完全打不开**（用户实际看到的现象："点设置后未弹出界面"）
+2. **压缩资源重压缩后变大** → 脚本**静默回退**成原版 → 那两个文件根本没改
+
+设备没坏，但补丁是坏的。用户看到的就是"菜单打不开 + 外观没变"。
+
+## 现在强制执行的五条规则
+
+### 1. 元素类型一起换，净减小体积
+
+把 `BorderImage` / `Image` 整个换成 `Rectangle`：
 
 ```qml
 Rectangle {
     id: backgroundImage
+    anchors { ... }
     color: "#cc0e2033"
     radius: 18
     border.color: "#4a7a9a"
@@ -69,79 +47,104 @@ Rectangle {
 }
 ```
 
-顺带的好处：`Rectangle` 比 `BorderImage` 短，天然满足铁律 1。
+`BorderImage` 的九宫格 + 两个 `TileMode` 属性比 `Rectangle` 长得多，
+所以换完之后**体积反而变小**，天然塞得进槽位。
 
-## 铁律 3：每处替换必须断言，失败即中止
+实测：
 
-第一版有两个压缩资源（`OptionMenuList` / `ContextMenuList`）在重新压缩后
-**变大了**，脚本于是**静默跳过**——刷完发现这两个文件根本没改。
+| 文件 | 原大小 | 改后 | 槽位 | 存储方式 |
+|---|---|---|---|---|
+| `OptionMenu.qml` | 2888 B | 2858 B | 2888 B | 未压缩 |
+| `OptionMenuList.qml` | 8702 B | 7174 B | 2174 B | 压缩后 1751 B |
+| `ContextMenu.qml` | 1860 B | 1738 B | 1860 B | 未压缩 |
+| `ContextMenuList.qml` | 5880 B | 4978 B | 1685 B | 压缩后 1183 B |
+| `NavigationBar.qml` | 2755 B | 2375 B | 2755 B | 未压缩 |
 
-现在改成：
+### 2. 剥离 CJK 注释腾空间
+
+原厂 QML 里有大量日文注释（`// NavigationBarの高さ分考慮`）。
+UTF-8 里一个日文字符 3 字节，删掉这些注释能省 143 ~ 860 字节 —— 是**最便宜的
+空间来源**，且完全不影响语义。
+
+```python
+def strip_cjk_comments(text):
+    for line in text.split("\n"):
+        m = re.search(r"//.*", line)
+        if m and re.search(r"[^\x00-\x7f]", m.group()):
+            line = line[:m.start()].rstrip()
+```
+
+只删**含非 ASCII 字符**的注释 —— 纯英文注释保留，不损失可读性。
+
+### 3. 每处替换必须断言
 
 ```python
 for old, new in subs:
     if old not in text:
-        raise RuntimeError(f"{basename}: substitution did not match:\n{old[:120]}")
+        raise RuntimeError(f"{basename}: substitution did not match")
     text = text.replace(old, new)
 ```
 
-匹配不上就整个构建失败。宁可不出包，也不出半个包。
+**绝不允许静默跳过。** 静默跳过 = 用户拿到一个"改了一半"的 UI，
+而你以为成功了。
 
-## 铁律 4：不引入昂贵构造
-
-在 854×480、入门级 Mali GPU、Qt 5.6 默认渲染器上，下面这些都会带来
-额外的离屏渲染：
+### 4. 塞不下就中止，不截断、不回退
 
 ```python
-BANNED_TOKENS = (
-    b"FastBlur", b"GaussianBlur", b"DropShadow", b"ShaderEffect",
-    b"layer.enabled", b"opacity:",
-)
+if len(stored) > slot:
+    raise QtResourceError(f"payload {len(stored)}B does not fit slot {slot}B")
 ```
 
-注意最后一个 `opacity:`。在 Qt Quick 里，**给一个有子元素的 Item 设
-`opacity < 1` 会触发 group opacity**，也就是把整棵子树先渲染到离屏
-FBO 再合成——对这块 SoC 是实打实的开销。
+截断会产生语法错误（第一版的教训），回退会让改动失效（第一版的另一个教训）。
+唯一正确的做法是**报错让人来处理**。
 
-玻璃质感改用**单条 ARGB 颜色**表达：
+### 5. 写回后立即读回校验
 
-```qml
-color: "#cc0e2033"      // A=0xCC, R=0x0E, G=0x20, B=0x33
+```python
+fs.write_file(exts, bytes(blob))
+back, _ = fs.read_file(ino)
+if back != bytes(blob):
+    raise RuntimeError("read-back mismatch")
 ```
 
-而不是：
+以及 QML 层面的语义校验：
 
-```qml
-color: "#0e2033"
-opacity: 0.8            // ← 会被禁用
+- 大括号平衡（深度归零且**从未为负**）
+- 结尾确实是 `}`（没被截断）
+- 不含 `BorderImage` 残留
+- 含全部 8 个玻璃配色字面量
+
+## 填充字节的选择
+
+| 类型 | 填充 | 理由 |
+|---|---|---|
+| 未压缩（文本） | `0x20`（空格） | QML 解析器若读越界，空格是无害空白；NUL 不是 |
+| 压缩（二进制） | `0x00` | zlib 流之后是填充，零最自然 |
+
+## 一个实现陷阱
+
+`QtResources` 工作在**自己的副本**上（`self.d = bytearray(blob)`）。
+所以每改一个文件，必须立刻把整个 chunk 写回 `blob`：
+
+```python
+written = res.write(data_off, flags, new_bytes, pad=pad)
+blob[:] = res.tobytes()          # ← 漏了这行，所有改动会静默消失
 ```
 
-构建时对这四个 token 做断言，命中就直接失败。
-
-## 铁律 5：写完必须回读校验
-
-每个文件写完都重新解出来检查：
-
-1. 大括号平衡（深度回到 0，且过程中从未为负）；
-2. 文件末尾确实是 `}`，没有被截断；
-3. `BorderImage` 已完全消失；
-4. 八个玻璃配色字面量都在；
-5. 没有命中禁用 token。
-
-另外整个 ELF 写回 ext4 之后再读一次，与内存中的补丁结果逐字节比较。
+而且必须**在重新读取之前**写回 —— 否则下一次 `QtResources(blob, ...)`
+拿到的是旧数据，前面的修改全部丢失。
 
 ---
 
-## 附：为什么不做模糊
+## 检查清单（发布前必过）
 
-真正的 Liquid Glass 有背景模糊。这里没做，原因是：
-
-* Qt 5.6 的 `FastBlur` / `GaussianBlur` 是纯软件实现或需要 shader，
-  在 854×480 上每帧都要读一遍背景纹理再做多轮采样；
-* 设备 GPU 显存和带宽都很紧张；
-* 屏幕只有 480 像素宽，菜单面板约 350×580，模糊带来的观感提升有限，
-  但掉帧是立刻能感觉到的。
-
-所以用「高 alpha 深色 + 圆角 + 1px 高光边」模拟玻璃的层次感。
-如果哪天愿意接受性能代价，`QtGraphicalEffects` 是可以加进来的，
-但必须先拿掉 `BANNED_TOKENS` 里的对应项。
+- [ ] 5 个 QML 文件的替换**全部**命中（无 MISS）
+- [ ] 每个文件改后体积 ≤ 槽位
+- [ ] 大括号平衡、结尾完整
+- [ ] 8 个玻璃配色字面量都在
+- [ ] 无 `BorderImage` 残留
+- [ ] 无 `FastBlur` / `GaussianBlur` / `DropShadow` / `ShaderEffect` / `layer.enabled` / `opacity:`
+- [ ] `system.img` 与 stock 的差异**只落在**两个预期文件上
+- [ ] ext4 元数据（超级块、GDT）逐字节相同
+- [ ] `.UPG` 的 sector 1 清单 MD5 已同步
+- [ ] 容器整包 MD5 自校验通过

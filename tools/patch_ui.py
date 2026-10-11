@@ -106,7 +106,11 @@ def patch_qml(blob: bytearray, report: list) -> int:
         text = strip_cjk_comments(text)
         new_bytes = text.encode("utf-8")
 
-        written = res.write(data_off, flags, new_bytes)
+        # Pad raw text with spaces, binary (compressed) payloads with NULs.
+        # Spaces are the safe filler for anything a QML parser might scan past
+        # the declared length; NULs would not be.
+        pad = 0x00 if (flags & 1) else 0x20
+        written = res.write(data_off, flags, new_bytes, pad=pad)
         blob[:] = res.tobytes()          # commit immediately
         report.append(f"  {basename:<22} {len(dec):>6}B -> {len(new_bytes):>6}B "
                       f"(-{before - len(new_bytes)}B comments, slot {slot}B, "
