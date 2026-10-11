@@ -1,0 +1,16 @@
+{
+  "_comment": [
+    "Rename this file to keys.local.json and fill in the real values.",
+    "keys.local.json is git-ignored on purpose - do not commit real keys.",
+    "",
+    "kas        : hex string, the device-family key material",
+    "aes_passkey: 16 ASCII characters",
+    "aes_iv     : 16 ASCII characters",
+    "",
+    "These are used only by the .UPG container pack/unpack step. The resource",
+    "and QML tooling in this repository works without them."
+  ],
+  "kas": "REPLACE_WITH_HEX",
+  "aes_passkey": "REPLACE_16_CHARS",
+  "aes_iv": "REPLACE_16_CHARS"
+}

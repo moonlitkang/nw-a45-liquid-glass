@@ -1,0 +1,25 @@
+# key material - never commit
+keys.local.json
+keys.json
+
+# build products
+work/
+*.img
+*.UPG
+*.upg
+*.exe
+out/
+dist/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# editors / OS
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store

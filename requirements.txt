@@ -1,0 +1,7 @@
+# Only needed for the .UPG container step (pack / unpack).
+# Everything else - ext4, Qt resources, QML patching, verification - is stdlib only.
+pycryptodome>=3.20
+
+# Optional: only needed if you want to inspect or resize existing PNG resources.
+# The theme itself uses tools/minpng.py, which has no dependencies.
+Pillow>=10.0
